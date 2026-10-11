@@ -292,7 +292,17 @@ public final class BuildModules {
             return d.z > 0 ? Direction.SOUTH : Direction.NORTH;
         }
 
-        private Plan plan(int i, Vec3d eye) { return plan(i, eye, false); }
+        private Plan plan(int i, Vec3d eye) { return plan(i, eye, false, 0); }
+
+        private Plan plan(int i, Vec3d eye, boolean ignoreFacing) { return plan(i, eye, ignoreFacing, 0); }
+
+        /** Blocks that open a screen / toggle when right clicked: clicking against them would not place anything. */
+        private static boolean interactive(BlockState s) {
+            Block b = s.getBlock();
+            return b instanceof BlockWithEntity || b instanceof CraftingTableBlock || b instanceof DoorBlock || b instanceof TrapdoorBlock
+                    || b instanceof FenceGateBlock || b instanceof ButtonBlock || b instanceof LeverBlock || b instanceof AnvilBlock
+                    || b instanceof NoteBlock;
+        }
 
         /** Horizontal direction you face when looking from eye to hit; null when that is too close to a diagonal / straight up or down to be reliable. */
         private static Direction facingFrom(Vec3d eye, Vec3d hit) {
@@ -301,10 +311,11 @@ public final class BuildModules {
             return ax > az ? (dx > 0 ? Direction.EAST : Direction.WEST) : (dz > 0 ? Direction.SOUTH : Direction.NORTH);
         }
 
-        private Plan plan(int i, Vec3d eye, boolean ignoreFacing) {
+        /** margin > 0 = planning for a spot we have not reached yet: shrink the reach so small position errors on arrival do not matter. */
+        private Plan plan(int i, Vec3d eye, boolean ignoreFacing, double margin) {
             Litematic.Entry e = view.get(i);
             BlockPos wp = world(e);
-            double rr = reach.get();
+            double rr = reach.get() - margin;
             if (Vec3d.ofCenter(wp).squaredDistanceTo(eye) > (rr + 1.0) * (rr + 1.0)) return null;
             BlockState want = e.state(), cur = mc.world.getBlockState(wp);
             if (cur.getBlock() == want.getBlock()) { if (!done.get(i)) { done.set(i); doneCount++; } return null; }
@@ -313,6 +324,8 @@ public final class BuildModules {
             Item item = want.getBlock().asItem();
             if (item == Items.AIR) { done.set(i); return null; }
             if (!canGet(item)) return null;
+            // never place a solid block into the space we are standing in (the server refuses it and the block "ghosts")
+            if (margin == 0 && !want.getCollisionShape(mc.world, wp).isEmpty() && mc.player.getBoundingBox().intersects(new Box(wp))) return null;
             Direction need = needFacing(want);
             Direction.Axis axis = want.contains(Properties.AXIS) ? want.get(Properties.AXIS) : null;
 
@@ -320,9 +333,12 @@ public final class BuildModules {
             for (Direction d : Direction.values()) {
                 BlockPos n = wp.offset(d);
                 BlockState ns = mc.world.getBlockState(n);
-                if (ns.isReplaceable() || !ns.getFluidState().isEmpty()) continue;
+                if (ns.isReplaceable() || !ns.getFluidState().isEmpty() || interactive(ns)) continue;
                 Direction face = d.getOpposite();
                 if (axis != null && face.getAxis() != axis) continue;
+                // clicking the top of a block always gives the bottom half, clicking the underside always the top half
+                if (face == Direction.UP && top(want)) continue;
+                if (face == Direction.DOWN && bottom(want)) continue;
                 double yOff = face.getAxis().isHorizontal() ? (top(want) ? 0.25 : bottom(want) ? -0.25 : 0) : 0;
                 Vec3d hit = Vec3d.ofCenter(n).add(face.getOffsetX() * 0.5, face.getOffsetY() * 0.5 + yOff, face.getOffsetZ() * 0.5);
                 if (!ignoreFacing && matchFacing.get() && need != null && facingFrom(eye, hit) != need) continue;
@@ -564,17 +580,43 @@ public final class BuildModules {
             return false;
         }
 
+        private record PN(BlockPos pos, double cost) {}
+
+        /** Is the floor under this feet cell a block of the schematic that is already built? */
+        private boolean builtFloor(BlockPos feet) {
+            BlockPos b = base();
+            if (b == null) return false;
+            BlockPos g = feet.down();
+            int i = idxAt(g.getX() - b.getX(), g.getY() - b.getY(), g.getZ() - b.getZ());
+            return i >= 0 && done.get(i);
+        }
+
+        /** The search is limited to the area around the schematic (plus the area around the start) so the node budget is not wasted on the whole world. */
+        private boolean inArea(BlockPos p, BlockPos start) {
+            if (Math.abs(p.getX() - start.getX()) <= 16 && Math.abs(p.getZ() - start.getZ()) <= 16 && Math.abs(p.getY() - start.getY()) <= 12) return true;
+            BlockPos b = base();
+            if (b == null) return true;
+            return p.getX() >= b.getX() - 20 && p.getX() <= b.getX() + vx + 20
+                    && p.getZ() >= b.getZ() - 20 && p.getZ() <= b.getZ() + vz + 20
+                    && p.getY() >= b.getY() - 10 && p.getY() <= b.getY() + vy + 10;
+        }
+
         /**
-         * Breadth-first search over standable cells: flat, 1 up (jump), up to 3 down, up/down along ladders and vines, and up/down/sideways
-         * through water. Returns the cells to walk to, empty when the start already is a goal, null when none is reachable.
+         * Cheapest-route search (Dijkstra) over standable cells: flat, 1 up (jump), up to 3 down, up/down along ladders and vines, and up/down/sideways
+         * through water. Standing on the part that is already built is cheap; stepping off it costs a lot, so the route stays on the built part whenever
+         * that is possible. Returns the cells to walk to, empty when the start already is a goal, null when none is reachable.
          */
         private List<BlockPos> findPath(BlockPos start, Predicate<BlockPos> goal, int max) {
-            ArrayDeque<BlockPos> q = new ArrayDeque<>();
+            PriorityQueue<PN> q = new PriorityQueue<>(Comparator.comparingDouble(PN::cost));
             Map<BlockPos, BlockPos> prev = new HashMap<>();
-            q.add(start); prev.put(start, start);
+            Map<BlockPos, Double> best = new HashMap<>();
+            q.add(new PN(start, 0)); prev.put(start, start); best.put(start, 0.0);
             int nodes = 0;
-            while (!q.isEmpty() && nodes++ < max) {
-                BlockPos c = q.poll();
+            while (!q.isEmpty() && nodes < max) {
+                PN cur = q.poll();
+                BlockPos c = cur.pos();
+                if (cur.cost() > best.getOrDefault(c, Double.MAX_VALUE)) continue;   // outdated queue entry
+                nodes++;
                 if (goal.test(c)) {
                     List<BlockPos> out = new ArrayList<>();
                     for (BlockPos t = c; !t.equals(start); t = prev.get(t)) out.add(t);
@@ -598,10 +640,16 @@ public final class BuildModules {
                 boolean wet = isWater(c), clim = climbable(c);
                 if ((wet || clim) && standable(c.up())) next.add(c.up());
                 if ((wet || clim || isWater(c.down()) || climbable(c.down())) && standable(c.down())) next.add(c.down());
+                boolean onBuilt = builtFloor(c);
                 for (BlockPos to : next) {
-                    if (prev.containsKey(to)) continue;
-                    prev.put(to, c);
-                    q.add(to);
+                    if (!inArea(to, start)) continue;
+                    double step = 1.0 + Math.abs(to.getY() - c.getY()) * 0.5;
+                    if (!builtFloor(to)) step += onBuilt ? 8.0 : 0.4;   // leaving the built part is expensive
+                    double nc = cur.cost() + step;
+                    if (nc < best.getOrDefault(to, Double.MAX_VALUE)) {
+                        best.put(to, nc); prev.put(to, c);
+                        q.add(new PN(to, nc));
+                    }
                 }
             }
             return null;
@@ -612,7 +660,7 @@ public final class BuildModules {
             BlockPos wp = world(view.get(t));
             if (c.equals(wp) || c.up().equals(wp) || pending(c) || pending(c.up())) return false;
             Vec3d eye = new Vec3d(c.getX() + 0.5, c.getY() + 1.62, c.getZ() + 0.5);
-            return plan(t, eye, false) != null;
+            return plan(t, eye, false, 0.6) != null;
         }
 
         /** Could this block be placed at all right now (item obtainable, something to click against)? */
@@ -630,22 +678,25 @@ public final class BuildModules {
             return false;
         }
 
-        /** Selecting the next walk target when no path is active. */
-        private int selectTarget() {
+        /** The nearest placeable entries of the layer being built (up to cap): the route search tries all of them, not just one. */
+        private List<Integer> candidates(int cap) {
             Vec3d pe = mc.player.getEyePos();
             while (firstPending < view.size() && done.get(firstPending)) firstPending++;
-            int best = -1, bestY = Integer.MIN_VALUE, scanned = 0;
-            double bd = Double.MAX_VALUE;
+            List<G> found = new ArrayList<>();
+            int layer = Integer.MIN_VALUE, scanned = 0;
             for (int i = firstPending; i < view.size(); i++) {
                 if (done.get(i)) continue;
                 Litematic.Entry e = view.get(i);
-                if (best >= 0 && order.is("Bottom-up") && e.y() > bestY) break;
+                if (layer != Integer.MIN_VALUE && order.is("Bottom-up") && e.y() > layer) break;
                 if (++scanned > 30000) break;
                 if (bad(i) || !wantable(i)) continue;
-                double d = Vec3d.ofCenter(world(e)).squaredDistanceTo(pe);
-                if (best < 0 || d < bd) { best = i; bd = d; bestY = e.y(); }
+                if (layer == Integer.MIN_VALUE) layer = e.y();
+                found.add(new G(Vec3d.ofCenter(world(e)).squaredDistanceTo(pe), i));
             }
-            return best;
+            found.sort(Comparator.comparingDouble(G::d));
+            List<Integer> out = new ArrayList<>();
+            for (int k = 0; k < Math.min(cap, found.size()); k++) out.add(found.get(k).i());
+            return out;
         }
 
         // ---- restock trips
@@ -683,7 +734,7 @@ public final class BuildModules {
             List<BlockPos> np = findPath(feet, c -> {
                 for (BlockPos ch : chests) if (chestGoal(ch, c)) { foundChest = ch; return true; }
                 return false;
-            }, 3500);
+            }, 6000);
             if (np == null) { walkStatus = "No route to a chest"; walkCd = 40; return false; }
             if (np.isEmpty()) return false;
             path = np; pathIdx = 0; stuck = 0; pathTicks = 0; lastPos = null; walkIdx = -1; walkChest = foundChest;
@@ -760,22 +811,34 @@ public final class BuildModules {
                 if (walkCd > 0) { walkCd--; return false; }
                 walkStatus = "";
                 BlockPos feet = p.getBlockPos();
-                int t = selectTarget();
-                if (t < 0) {
+                List<Integer> cand = candidates(24);
+                if (cand.isEmpty()) {
                     walkIdx = -1;
                     if (chestWalk(feet)) { walkStatus = "Walking to chest"; return true; }
                     if (walkCd == 0) walkCd = 4;
                     return false;
                 }
                 walkChest = null;
-                List<BlockPos> np = findPath(feet, c -> goalFor(t, c), 3500);
-                if (np == null) { badTargets.put(t, walkClock + 200); walkStatus = "No route to next block"; walkCd = 20; walkIdx = -1; return false; }
+                final int[] found = {-1};
+                final double rq = (reach.get() + 1.0) * (reach.get() + 1.0);
+                List<BlockPos> np = findPath(feet, c -> {
+                    for (int t : cand) {
+                        if (Vec3d.ofCenter(world(view.get(t))).squaredDistanceTo(c.getX() + 0.5, c.getY() + 1.62, c.getZ() + 0.5) > rq) continue;
+                        if (goalFor(t, c)) { found[0] = t; return true; }
+                    }
+                    return false;
+                }, 6000);
+                if (np == null) {   // none of the nearest blocks can be reached: park them and look at others next time
+                    for (int t : cand) badTargets.put(t, walkClock + 200);
+                    walkStatus = "No route to next block"; walkCd = 20; walkIdx = -1;
+                    return false;
+                }
                 if (np.isEmpty()) {   // in reach already, yet pick() found nothing from the exact spot: park it briefly
-                    badTargets.put(t, walkClock + 80);
+                    if (found[0] >= 0) badTargets.put(found[0], walkClock + 80);
                     walkIdx = -1;
                     return false;
                 }
-                walkIdx = t; path = np; pathIdx = 0; stuck = 0; pathTicks = 0; lastPos = null;
+                walkIdx = found[0]; path = np; pathIdx = 0; stuck = 0; pathTicks = 0; lastPos = null;
             }
 
             BlockPos wp = path.get(pathIdx);
@@ -952,6 +1015,7 @@ public final class BuildModules {
             Vec3d hit = pl.hit();
             Direction face = pl.face();
             if (rotate.get()) {
+                float yaw0 = p.getYaw(), pitch0 = p.getPitch();   // = the rotation the server already knows (it was sent at the start of this tick)
                 float[] t = U.rotTo(pl.hit());
                 float[] r = U.smoothRot(p.getYaw(), p.getPitch(), t[0], t[1], aimSpeed.get(), maxTurn.get(), humanize.get(), true);
                 p.setYaw(r[0]); p.setPitch(r[1]);
@@ -962,7 +1026,17 @@ public final class BuildModules {
                 face = faceOf(pl.against(), hit);
                 if (!pl.against().offset(face).equals(pl.pos())) return false;
                 Direction need = needFacing(pl.state());
-                if (matchFacing.get() && need != null && p.getHorizontalFacing() != need) return false;
+                if (matchFacing.get() && need != null) {
+                    if (p.getHorizontalFacing() != need) return false;
+                    // blocks with a facing take it from the SERVER's idea of our rotation, which is still the old one: wait until it is (almost) there
+                    if (Math.abs(MathHelper.wrapDegrees(r[0] - yaw0)) > 3f || Math.abs(r[1] - pitch0) > 3f) return false;
+                }
+                // slabs / stairs / trapdoors on a side face: the half depends on where on the face we click
+                if (face.getAxis().isHorizontal()) {
+                    double fy = hit.y - pl.against().getY();
+                    if (top(pl.state()) && fy < 0.55) return false;
+                    if (bottom(pl.state()) && fy > 0.45) return false;
+                }
             }
             mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, new BlockHitResult(hit, face, pl.against(), false));
             p.swingHand(Hand.MAIN_HAND);
