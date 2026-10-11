@@ -6,6 +6,11 @@ import net.minecraft.block.enums.BedPart;
 import net.minecraft.block.enums.BlockHalf;
 import net.minecraft.block.enums.DoubleBlockHalf;
 import net.minecraft.block.enums.SlabType;
+import net.minecraft.block.entity.BarrelBlockEntity;
+import net.minecraft.block.entity.BlockEntity;
+import net.minecraft.block.entity.ChestBlockEntity;
+import net.minecraft.block.entity.EnderChestBlockEntity;
+import net.minecraft.block.entity.TrappedChestBlockEntity;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -24,6 +29,7 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
+import net.minecraft.world.chunk.WorldChunk;
 import nova.core.*;
 import nova.modules.ClientModules.Theme;
 import nova.schem.Litematic;
@@ -60,10 +66,12 @@ public final class BuildModules {
         Setting.Bool rotate = bool("Rotate", true), ray = bool("Line of sight check", true), humanize = bool("Humanize", true),
                 matchFacing = bool("Match facing", true), creative = bool("Creative fill", true);
         Setting.Bool restock = bool("Take items from chests", true);
+        Setting.Num chestRange = num("Chest range", 64, 16, 160, 4);
         Setting.Num aimSpeed = num("Aim speed", 40, 5, 100, 1), maxTurn = num("Max turn / tick", 25, 2, 90, 1);
         Setting.Bool outline = bool("Show outline", true), showNext = bool("Show next block", true), progress = bool("Progress HUD", true);
         Setting.Bool useLitematica = bool("Load into Litematica", true), showSchem = bool("Built-in preview", false), walk = bool("Auto walk", true), edgeSafety = bool("Sneak at edges", true), showPath = bool("Show path", true);
         Setting.Bool filler = bool("Filler blocks", true), cleanFiller = bool("Remove filler when done", true);
+        Setting.Bool fixWrong = bool("Fix wrong blocks", true), fixForeign = bool("Replace other wrong blocks", false);
         Setting.Mode fillerBlock = mode("Filler block", "Cobblestone", "Cobblestone", "Dirt", "Stone", "Netherrack", "Cobbled Deepslate", "Oak Planks");
         Setting.Num ghostRange = num("Preview range", 12, 6, 48, 1), ghostMax = num("Preview blocks", 40, 10, 400, 10);
 
@@ -120,6 +128,17 @@ public final class BuildModules {
         boolean bridgeBusy;
         Item fillCache;
 
+        // wrong blocks: junk = blocks we are going to break so the right one can be placed, ours = every position we placed something at
+        final Set<BlockPos> junk = new HashSet<>(), ours = new HashSet<>(), gaveUp = new HashSet<>();
+        final Map<BlockPos, Integer> fixTries = new HashMap<>();
+        int wrongCount, recWrong;
+
+        // restock: chest list cache, wide route search, last error
+        List<BlockPos> chestCache = List.of();
+        int chestCacheTick = -9999;
+        boolean wideArea;
+        String lastErr = "";
+
         public Schematic() { super("Schematic", Category.WORLD, "Auto builds a loaded .litematic file."); }
 
         private List<Path> dirs() {
@@ -164,7 +183,7 @@ public final class BuildModules {
             }
         }
 
-        void unload() { schem = null; view.clear(); done.clear(); nextPos = null; curIdx = -1; ghosts = List.of(); keys = new long[0]; surf.clear(); resetWalk(); removeLite(); fillers.clear(); fillTarget = null; status = "Unloaded."; }
+        void unload() { schem = null; view.clear(); done.clear(); nextPos = null; curIdx = -1; ghosts = List.of(); keys = new long[0]; surf.clear(); resetWalk(); removeLite(); fillers.clear(); fillTarget = null; junk.clear(); ours.clear(); gaveUp.clear(); fixTries.clear(); wrongCount = 0; status = "Unloaded."; }
 
         void originHere() {
             if (mc.player == null) return;
@@ -182,7 +201,7 @@ public final class BuildModules {
             } else U.chat("Look at a block first.");
         }
 
-        private void resetProgress() { done.clear(); firstPending = 0; doneCount = 0; curIdx = -1; tick = 0; recPos = -1; ghosts = List.of(); badTargets.clear(); resetWalk(); }
+        private void resetProgress() { done.clear(); firstPending = 0; doneCount = 0; curIdx = -1; tick = 0; recPos = -1; ghosts = List.of(); badTargets.clear(); junk.clear(); ours.clear(); gaveUp.clear(); fixTries.clear(); wrongCount = 0; resetWalk(); }
 
         void rebuildView() {
             if (schem == null) return;
@@ -268,6 +287,49 @@ public final class BuildModules {
             return true;
         }
 
+        /** Is the block in the world really what the schematic wants: same block AND the orientation / half / axis we are able to control. */
+        private boolean sameState(BlockState want, BlockState cur) {
+            if (cur.getBlock() != want.getBlock()) return false;
+            if (matchFacing.get() && needFacing(want) != null && cur.contains(Properties.HORIZONTAL_FACING)
+                    && cur.get(Properties.HORIZONTAL_FACING) != want.get(Properties.HORIZONTAL_FACING)) return false;
+            if (want.contains(Properties.AXIS) && cur.contains(Properties.AXIS) && want.get(Properties.AXIS) != cur.get(Properties.AXIS)) return false;
+            if (want.contains(Properties.BLOCK_HALF) && cur.contains(Properties.BLOCK_HALF) && want.get(Properties.BLOCK_HALF) != cur.get(Properties.BLOCK_HALF)) return false;
+            if (want.contains(Properties.SLAB_TYPE) && cur.contains(Properties.SLAB_TYPE)) {
+                SlabType w = want.get(Properties.SLAB_TYPE), c = cur.get(Properties.SLAB_TYPE);
+                if (w != SlabType.DOUBLE && c != SlabType.DOUBLE && w != c) return false;
+            }
+            return true;
+        }
+
+        private BlockState wantAt(BlockPos w) {
+            BlockPos b = base();
+            if (b == null) return null;
+            int i = idxAt(w.getX() - b.getX(), w.getY() - b.getY(), w.getZ() - b.getZ());
+            return i >= 0 ? view.get(i).state() : null;
+        }
+
+        /** A block that is not what the schematic wants stands at wp: remember it so it gets broken and placed again (a few tries, then it is accepted). */
+        private void noteWrong(BlockPos wp, BlockState want, BlockState cur) {
+            if (!fixWrong.get() || junk.contains(wp) || gaveUp.contains(wp) || cur.isAir()) return;
+            if (!ours.contains(wp) && !fixForeign.get()) return;
+            if (cur.getHardness(mc.world, wp) < 0) return;   // bedrock and the like
+            Item it = want.getBlock().asItem();
+            if (it == Items.AIR || !canGet(it)) return;
+            BlockPos ip = wp.toImmutable();
+            int t = fixTries.merge(ip, 1, Integer::sum);
+            if (t > 3) { gaveUp.add(ip); return; }
+            junk.add(ip);
+        }
+
+        private void pruneJunk() {
+            junk.removeIf(j -> {
+                BlockState c = mc.world.getBlockState(j);
+                if (c.isReplaceable()) return true;
+                BlockState w = wantAt(j);
+                return w != null && sameState(w, c);
+            });
+        }
+
         private static boolean skipState(BlockState s) {
             if (s.contains(Properties.DOUBLE_BLOCK_HALF) && s.get(Properties.DOUBLE_BLOCK_HALF) == DoubleBlockHalf.UPPER) return true;
             if (s.contains(Properties.BED_PART) && s.get(Properties.BED_PART) == BedPart.HEAD) return true;
@@ -327,9 +389,9 @@ public final class BuildModules {
             double rr = reach.get() - margin;
             if (Vec3d.ofCenter(wp).squaredDistanceTo(eye) > (rr + 1.0) * (rr + 1.0)) return null;
             BlockState want = e.state(), cur = mc.world.getBlockState(wp);
-            if (cur.getBlock() == want.getBlock()) { if (!done.get(i)) { done.set(i); doneCount++; } return null; }
+            if (sameState(want, cur) || gaveUp.contains(wp)) { if (!done.get(i)) { done.set(i); doneCount++; } return null; }
             if (skipState(want)) { done.set(i); return null; }
-            if (!cur.isReplaceable()) return null;
+            if (!cur.isReplaceable()) { noteWrong(wp, want, cur); return null; }
             Item item = want.getBlock().asItem();
             if (item == Items.AIR) { done.set(i); return null; }
             if (!canGet(item)) return null;
@@ -536,31 +598,38 @@ public final class BuildModules {
             return true;
         }
 
-        // ---- taking the filler away again once everything is built
+        // ---- taking blocks away again: wrong blocks right away, filler once everything is built
         private boolean allDone() { return !view.isEmpty() && done.cardinality() >= view.size(); }
+
+        /** Everything we want to break now. */
+        private Set<BlockPos> removeSet() {
+            pruneJunk();
+            fillers.removeIf(f -> mc.world.getBlockState(f).isReplaceable());
+            Set<BlockPos> r = new HashSet<>(junk);
+            if (cleanFiller.get() && allDone()) r.addAll(fillers);
+            return r;
+        }
 
         private boolean breakGoal(BlockPos f, BlockPos c) {
             if (c.equals(f) || c.up().equals(f) || c.down().equals(f)) return false;
             Vec3d eye = new Vec3d(c.getX() + 0.5, c.getY() + 1.62, c.getZ() + 0.5), ctr = Vec3d.ofCenter(f);
             if (eye.distanceTo(ctr) > reach.get() - 0.8) return false;
-            BlockHitResult rh = mc.world.raycast(new RaycastContext(eye, ctr, RaycastContext.ShapeType.COLLIDER,
-                    RaycastContext.FluidHandling.NONE, mc.player));
+            BlockHitResult rh = mc.world.raycast(new RaycastContext(eye, ctr, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, mc.player));
             return rh.getType() != HitResult.Type.BLOCK || rh.getBlockPos().equals(f);
         }
 
-        /** A filler block we can break from where we stand (not the one under / in us). */
-        private BlockPos breakable() {
+        /** A block of the set that we can break from where we stand (not the one under / in us). */
+        private BlockPos breakable(Collection<BlockPos> set) {
             var p = mc.player;
             Vec3d eye = p.getEyePos();
             BlockPos fb = p.getBlockPos();
             BlockPos best = null; double bd = Double.MAX_VALUE;
-            for (BlockPos f : fillers) {
+            for (BlockPos f : set) {
                 if (f.equals(fb) || f.equals(fb.up()) || f.equals(fb.down())) continue;
                 Vec3d ctr = Vec3d.ofCenter(f);
                 double d = eye.squaredDistanceTo(ctr);
                 if (d > (reach.get() - 0.4) * (reach.get() - 0.4) || d >= bd) continue;
-                BlockHitResult rh = mc.world.raycast(new RaycastContext(eye, ctr, RaycastContext.ShapeType.COLLIDER,
-                        RaycastContext.FluidHandling.NONE, p));
+                BlockHitResult rh = mc.world.raycast(new RaycastContext(eye, ctr, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, p));
                 if (rh.getType() == HitResult.Type.BLOCK && !rh.getBlockPos().equals(f)) continue;
                 best = f; bd = d;
             }
@@ -568,31 +637,48 @@ public final class BuildModules {
         }
 
         private boolean cleanWalk(BlockPos feet) {
-            if (!cleanFiller.get() || fillers.isEmpty() || !allDone()) return false;
-            fillers.removeIf(f -> mc.world.getBlockState(f).isReplaceable());
-            if (fillers.isEmpty()) return false;
-            if (breakable() != null) return false;   // fillerCleanup() takes it from here
+            Set<BlockPos> rs = removeSet();
+            if (rs.isEmpty()) return false;
+            if (breakable(rs) != null) return false;   // fillerCleanup() takes it from here
             Vec3d eye = mc.player.getEyePos();
-            List<BlockPos> list = new ArrayList<>(fillers);
+            List<BlockPos> list = new ArrayList<>(rs);
             list.sort(Comparator.comparingDouble(f -> Vec3d.ofCenter(f).squaredDistanceTo(eye)));
             if (list.size() > 12) list = new ArrayList<>(list.subList(0, 12));
             final List<BlockPos> targets = list;
-            List<BlockPos> np = findPath(feet, c -> { for (BlockPos f : targets) if (breakGoal(f, c)) return true; return false; }, 6000);
-            if (np == null) { fillers.clear(); return false; }   // cannot get to them: forget them
+            List<BlockPos> np = findPath(feet, c -> {
+                for (BlockPos f : targets) if (breakGoal(f, c)) return true;
+                return false;
+            }, 6000);
+            if (np == null) {   // cannot get to them: forget them (wrong blocks are accepted as they are)
+                for (BlockPos t : targets) { if (junk.remove(t)) gaveUp.add(t); fillers.remove(t); }
+                return false;
+            }
             if (np.isEmpty()) return false;
             path = np; pathIdx = 0; stuck = 0; pathTicks = 0; lastPos = null; walkIdx = -1; walkChest = null;
-            walkStatus = "Walking to filler";
+            walkStatus = junk.isEmpty() ? "Walking to filler" : "Walking to wrong block";
             return true;
         }
 
+        private void selectTool(BlockState st) {
+            if (mc.player.isCreative()) return;
+            var inv = mc.player.getInventory();
+            int best = inv.getSelectedSlot();
+            float bv = inv.getStack(best).getMiningSpeedMultiplier(st);
+            for (int sl = 0; sl < 9; sl++) {
+                float v = inv.getStack(sl).getMiningSpeedMultiplier(st);
+                if (v > bv + 0.01f) { bv = v; best = sl; }
+            }
+            if (best != inv.getSelectedSlot()) inv.setSelectedSlot(best);
+        }
+
         private boolean fillerCleanup() {
-            if (!cleanFiller.get() || fillers.isEmpty() || !allDone()) return false;
             var p = mc.player;
-            fillers.removeIf(f -> mc.world.getBlockState(f).isReplaceable());
-            BlockPos f = breakable();
+            Set<BlockPos> rs = removeSet();
+            if (rs.isEmpty()) return false;
+            BlockPos f = breakable(rs);
             if (f == null) return false;
             nextPos = f;
-            walkStatus = "Removing filler";
+            walkStatus = junk.contains(f) ? "Removing wrong block" : "Removing filler";
             Vec3d eye = p.getEyePos();
             float[] t = U.rotTo(Vec3d.ofCenter(f));
             float[] r = U.smoothRot(p.getYaw(), p.getPitch(), t[0], t[1], aimSpeed.get(), maxTurn.get(), humanize.get(), true);
@@ -600,6 +686,7 @@ public final class BuildModules {
             Vec3d end = eye.add(p.getRotationVec(1.0F).multiply(reach.get() + 0.5));
             BlockHitResult rh = mc.world.raycast(new RaycastContext(eye, end, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, p));
             if (rh.getType() == HitResult.Type.BLOCK && rh.getBlockPos().equals(f)) {
+                selectTool(mc.world.getBlockState(f));
                 mc.interactionManager.updateBlockBreakingProgress(f, rh.getSide());
                 p.swingHand(Hand.MAIN_HAND);
             }
@@ -638,18 +725,20 @@ public final class BuildModules {
         /** Recounts progress / missing items in slices of a few thousand blocks per tick (a full pass in one tick caused lag spikes). */
         private void recount() {
             if (base() == null) { recPos = -1; return; }
-            if (recPos < 0) { recPos = 0; recDone = new BitSet(); recCount = 0; recNeed = new HashMap<>(); }
+            if (recPos < 0) { recPos = 0; recDone = new BitSet(); recCount = 0; recWrong = 0; recNeed = new HashMap<>(); }
             int end = Math.min(view.size(), recPos + 3000);
             for (; recPos < end; recPos++) {
                 Litematic.Entry e = view.get(recPos);
-                BlockState cur = mc.world.getBlockState(world(e));
-                if (cur.getBlock() == e.state().getBlock() || skipState(e.state())) { recDone.set(recPos); recCount++; continue; }
+                BlockPos rwp = world(e);
+                BlockState cur = mc.world.getBlockState(rwp);
+                if (sameState(e.state(), cur) || skipState(e.state()) || gaveUp.contains(rwp)) { recDone.set(recPos); recCount++; continue; }
+                if (!cur.isReplaceable()) { recWrong++; noteWrong(rwp, e.state(), cur); }
                 Item it = e.state().getBlock().asItem();
                 if (it != Items.AIR) recNeed.merge(it, 1, Integer::sum);
             }
             if (recPos < view.size()) return;
             recPos = -1;
-            done.clear(); done.or(recDone); doneCount = recCount; firstPending = 0;
+            done.clear(); done.or(recDone); doneCount = recCount; firstPending = 0; wrongCount = recWrong;
             missing.clear();
             if (creative.get() && mc.player.isCreative()) return;
             var inv = mc.player.getInventory();
@@ -843,12 +932,17 @@ public final class BuildModules {
 
         /** The search is limited to the area around the schematic (plus the area around the start) so the node budget is not wasted on the whole world. */
         private boolean inArea(BlockPos p, BlockPos start) {
+            if (wideArea) {
+                int rg = chestRange.getInt() + 8;
+                return Math.abs(p.getX() - start.getX()) <= rg && Math.abs(p.getZ() - start.getZ()) <= rg && Math.abs(p.getY() - start.getY()) <= 40;
+            }
             if (Math.abs(p.getX() - start.getX()) <= 16 && Math.abs(p.getZ() - start.getZ()) <= 16 && Math.abs(p.getY() - start.getY()) <= 12) return true;
             BlockPos b = base();
             if (b == null) return true;
-            return p.getX() >= b.getX() - 20 && p.getX() <= b.getX() + vx + 20
-                    && p.getZ() >= b.getZ() - 20 && p.getZ() <= b.getZ() + vz + 20
-                    && p.getY() >= b.getY() - 10 && p.getY() <= b.getY() + vy + 10;
+            // one box around the schematic AND where we stand now, so the way back from a far chest is still inside it
+            return p.getX() >= Math.min(b.getX() - 20, start.getX() - 16) && p.getX() <= Math.max(b.getX() + vx + 20, start.getX() + 16)
+                    && p.getZ() >= Math.min(b.getZ() - 20, start.getZ() - 16) && p.getZ() <= Math.max(b.getZ() + vz + 20, start.getZ() + 16)
+                    && p.getY() >= Math.min(b.getY() - 10, start.getY() - 12) && p.getY() <= Math.max(b.getY() + vy + 10, start.getY() + 12);
         }
 
         /**
@@ -964,17 +1058,31 @@ public final class BuildModules {
 
         // ---- restock trips
         private List<BlockPos> nearbyChests() {
+            if (walkClock - chestCacheTick < 20) {
+                List<BlockPos> keep = new ArrayList<>();
+                for (BlockPos c : chestCache) if (!emptied.contains(c)) keep.add(c);
+                return keep;
+            }
+            chestCacheTick = walkClock;
             List<BlockPos> out = new ArrayList<>();
             BlockPos pc = mc.player.getBlockPos();
-            for (int x = -16; x <= 16; x++) for (int y = -8; y <= 8; y++) for (int z = -16; z <= 16; z++) {
-                BlockPos bp = pc.add(x, y, z);
-                if (emptied.contains(bp)) continue;
-                Block b = mc.world.getBlockState(bp).getBlock();
-                if (b instanceof ChestBlock || b instanceof BarrelBlock) out.add(bp.toImmutable());
+            double rg = chestRange.get();
+            int r = (int) Math.ceil(rg / 16.0) + 1, pcx = pc.getX() >> 4, pcz = pc.getZ() >> 4;
+            for (int dx = -r; dx <= r; dx++) for (int dz = -r; dz <= r; dz++) {
+                WorldChunk ch = mc.world.getChunkManager().getWorldChunk(pcx + dx, pcz + dz);
+                if (ch == null) continue;
+                for (BlockEntity be : ch.getBlockEntities().values()) {
+                    if (!(be instanceof ChestBlockEntity) && !(be instanceof BarrelBlockEntity)) continue;
+                    if (be instanceof EnderChestBlockEntity || be instanceof TrappedChestBlockEntity) continue;
+                    BlockPos bp = be.getPos();
+                    if (emptied.contains(bp) || Math.abs(bp.getX() - pc.getX()) > rg || Math.abs(bp.getZ() - pc.getZ()) > rg) continue;
+                    out.add(bp.toImmutable());
+                }
             }
             Vec3d eye = mc.player.getEyePos();
             out.sort(Comparator.comparingDouble(c -> Vec3d.ofCenter(c).squaredDistanceTo(eye)));
-            return out.size() > 24 ? new ArrayList<>(out.subList(0, 24)) : out;
+            chestCache = out.size() > 24 ? new ArrayList<>(out.subList(0, 24)) : out;
+            return chestCache;
         }
 
         private boolean chestGoal(BlockPos chest, BlockPos c) {
@@ -993,12 +1101,16 @@ public final class BuildModules {
         private boolean chestWalk(BlockPos feet) {
             if (!restock.get() || missing.isEmpty() || mc.player.isCreative() || mc.currentScreen != null) return false;
             List<BlockPos> chests = nearbyChests();
-            if (chests.isEmpty()) { walkStatus = "No chest left to restock from"; walkCd = 40; return false; }
-            List<BlockPos> np = findPath(feet, c -> {
-                for (BlockPos ch : chests) if (chestGoal(ch, c)) { foundChest = ch; return true; }
-                return false;
-            }, 6000);
-            if (np == null) { walkStatus = "No route to a chest"; walkCd = 40; return false; }
+            if (chests.isEmpty()) { walkStatus = "No chest within " + chestRange.getInt() + " blocks to restock from"; walkCd = 40; return false; }
+            wideArea = true;
+            List<BlockPos> np;
+            try {
+                np = findPath(feet, c -> {
+                    for (BlockPos ch : chests) if (chestGoal(ch, c)) { foundChest = ch; return true; }
+                    return false;
+                }, 30000);
+            } finally { wideArea = false; }
+            if (np == null) { walkStatus = "No route to a chest"; walkCd = 100; return false; }
             if (np.isEmpty()) return false;
             path = np; pathIdx = 0; stuck = 0; pathTicks = 0; lastPos = null; walkIdx = -1; walkChest = foundChest;
             return true;
@@ -1093,7 +1205,7 @@ public final class BuildModules {
                         if (goalFor(t, c)) { found[0] = t; return true; }
                     }
                     return false;
-                }, 6000);
+                }, 12000);
                 if (np == null) {   // none of the nearest blocks can be reached: park them and look at others next time
                     for (int t : cand) badTargets.put(t, walkClock + 200);
                     walkStatus = "No route to next block"; walkCd = 20; walkIdx = -1;
@@ -1185,6 +1297,7 @@ public final class BuildModules {
             emptied.add(chestPos);
             mc.player.closeHandledScreen();
             chestPos = null; rcd = 6; tick = 0;
+            badTargets.clear(); walkCd = 0; failCount = 0;   // blocks parked while we had no material can be tried again
             return true;
         }
 
@@ -1230,6 +1343,16 @@ public final class BuildModules {
         }
 
         @Override public void onTick() {
+            try { tickInner(); lastErr = ""; }
+            catch (Throwable t) {
+                String m = t.getClass().getSimpleName() + (t.getMessage() == null ? "" : ": " + t.getMessage());
+                if (!m.equals(lastErr)) { lastErr = m; U.chat("Schematic error (kept running): " + m); t.printStackTrace(); }
+                stopKeys(); chestPos = null; rcd = 10; cd = 10;
+                if (mc.player != null && mc.currentScreen != null && mc.player.currentScreenHandler != mc.player.playerScreenHandler) mc.player.closeHandledScreen();
+            }
+        }
+
+        private void tickInner() {
             walkClock++;
             if (schem == null || origin == null || mc.player == null || mc.world == null) { nextPos = null; if (ghosts.size() > 0) ghosts = List.of(); stopKeys(); return; }
             if (mc.currentScreen != null) stopKeys();
@@ -1244,6 +1367,8 @@ public final class BuildModules {
                 if (!path.isEmpty() && pathIdx < path.size()) walkStep();
                 return;
             }
+
+            if (!junk.isEmpty() && fixWrong.get() && fillerCleanup()) { stopKeys(); return; }   // a wrong block is in reach: break it first
 
             Set<BlockPos> placed = new HashSet<>();
             int limit = rotate.get() ? 1 : perTick.getInt();
@@ -1316,6 +1441,7 @@ public final class BuildModules {
             }
             mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, new BlockHitResult(hit, face, pl.against(), false));
             p.swingHand(Hand.MAIN_HAND);
+            ours.add(pl.pos().toImmutable());
             return true;
         }
 
@@ -1337,6 +1463,7 @@ public final class BuildModules {
                         pr.line3(ctx, new Vec3d(a.getX() + 0.5, a.getY() + 0.1, a.getZ() + 0.5), new Vec3d(c.getX() + 0.5, c.getY() + 0.1, c.getZ() + 0.5), Gfx.a(acc, 0.9f));
                     }
                 }
+                for (BlockPos j : junk) pr.wire(ctx, new Box(j).expand(0.004), 0xFFFF3B3B);
                 if (showNext.get() && nextPos != null) pr.wire(ctx, new Box(nextPos).expand(0.003), 0xFFFFFFFF);
             }
             if (!progress.get()) return;
@@ -1348,6 +1475,8 @@ public final class BuildModules {
                 if (lines.size() >= 4) break;
                 lines.add("Need " + en.getValue() + " " + Registries.ITEM.getId(en.getKey()).getPath().replace('_', ' '));
             }
+            if (!lastErr.isEmpty()) lines.add("Error: " + lastErr);
+            if (wrongCount > 0 && fixWrong.get()) lines.add(wrongCount + " wrong block" + (wrongCount == 1 ? "" : "s"));
             if (walk.get() && !walkStatus.isEmpty()) lines.add(walkStatus);
             int h = 28 + (schem != null ? 10 : 0) + lines.size() * 10;
             int y = mc.getWindow().getScaledHeight() - h - 40;

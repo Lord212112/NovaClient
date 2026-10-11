@@ -4,7 +4,7 @@ Fabric, Minecraft 1.21.11. Open the GUI with **Right Shift**.
 
 ## Build
 1. https://fabricmc.net/develop -> 1.21.11, copy exact versions into `gradle.properties`.
-2. JDK 21, `gradle build` (needs Gradle 9.x; or `./gradlew build` if you have the wrapper). After building, check the jar is not empty: `unzip -l build/libs/nova-client-2.6.1.jar` must list `fabric.mod.json` and `nova/*.class`. Jar: `build/libs/nova-client-2.6.1.jar` (not `-sources`). Put it in `mods/` with Fabric API.
+2. JDK 21, `gradle build` (needs Gradle 9.x; or `./gradlew build` if you have the wrapper). After building, check the jar is not empty: `unzip -l build/libs/nova-client-2.6.3.jar` must list `fabric.mod.json` and `nova/*.class`. Jar: `build/libs/nova-client-2.6.3.jar` (not `-sources`). Put it in `mods/` with Fabric API.
 
 ## GUI
 Icon tabs on the left, module cards in two columns. Left click = toggle, right click = fold out settings,
@@ -19,6 +19,18 @@ It turns smoothly to each face (Aim speed / Max turn), only clicks when the cros
 "Load into Litematica" (default on) hands the loaded file + origin + rotation to Litematica as a placement, so Litematica renders it (needs the Litematica mod; it follows origin/rotation/offset changes and is removed on Unload).
 "Built-in preview" is the old outline renderer, off by default because it is slow; only use it without Litematica.
 "Auto walk" walks (W + jump, smooth turning) to the nearest spot where the next block can be placed, then places as usual. "Show path" draws the route.
+
+## Changes in 2.6.3
+- Restock chests are found from far away: "Chest range" (World > Schematic, default 64 blocks, up to 160) scans every loaded chunk in range for chests and barrels (trapped and ender chests are skipped), the list is cached so it costs nothing per tick. Before it only looked about 16 blocks around you.
+- Chest trips no longer get stuck: the route search used to be boxed in around you and the schematic, so a far chest was either not found or there was no route back. Chest trips now search a wide area with a bigger node budget, and the route back to the schematic uses one box around the schematic and where you stand.
+- After restocking, blocks that were parked while there was no material are tried again straight away (previously they could sit parked for ~10 s, which looked like the builder had switched itself off).
+- An error inside the builder no longer switches the module off: it prints "Schematic error (kept running): ..." once in chat and in the progress HUD, closes any open container, and carries on. If you see that message, send it to me.
+
+## Changes in 2.6.2
+- Wrong blocks are detected and fixed. A block now only counts as built when it is the right block AND has the right facing (stairs, doors, gates, chests, furnaces, glazed terracotta), axis (logs, pillars), and top/bottom half (slabs, stairs, trapdoors). Before, any block of the same type counted as done, so wrongly rotated or flipped blocks were left alone, and a wrong block in a spot blocked it forever.
+- "Fix wrong blocks" (World > Schematic, on): wrong blocks that the builder placed itself (including filler that ended up on a schematic spot) are broken (best tool is picked in survival) and placed again. If one comes out wrong 3 times it is accepted as it is, so it can never loop forever. Walks to wrong blocks that are out of reach; they are outlined in red.
+- "Replace other wrong blocks" (off): also break wrong blocks the builder did NOT place (terrain, other builds) inside the schematic. Only on when you want the schematic to replace whatever is there; it never breaks unbreakable blocks or blocks whose replacement item it cannot get.
+- Progress HUD shows how many wrong blocks there are.
 
 ## Changes in 2.6.1
 - GUI glow reworked to match the orange look: soft wide ambient glow around the window (smooth quadratic falloff, no more hard rings), brighter accent rim, enabled cards get a soft glow + accent border + top sheen, toggles, tabs and slider fills glow wider. Default accent is a warmer orange.
