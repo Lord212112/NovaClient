@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.0
+
+      # An empty jar means the source files are not in the repo (or not in src/main/java).
+      # Fail here with a readable message instead of after the build.
+      - name: Check the repo layout
+        run: |
+          echo "Files in the repo (excluding .git):"
+          find . -path ./.git -prune -o -type f -print | sort | head -80
+          if [ ! -f src/main/java/nova/NovaClient.java ]; then
+            echo "::error::src/main/java/nova/NovaClient.java is missing from the repo root."
+            echo "Found NovaClient.java at: $(find . -name NovaClient.java -not -path './.git/*')"
+            echo "build.gradle, settings.gradle and the src folder must all be in the SAME folder (the repo root)."
+            exit 1
+          fi
+          test -f src/main/resources/fabric.mod.json || { echo "::error::src/main/resources/fabric.mod.json is missing"; exit 1; }
+
+      - name: Build
+        run: gradle build --stacktrace
+
+      - name: Check the jar is not empty
+        run: |
+          ls -la build/libs/
+          JAR=$(ls build/libs/nova-client-*.jar | grep -v -e '-sources' -e '-dev' | head -1)
+          echo "Checking $JAR"
+          unzip -l "$JAR"
+          unzip -l "$JAR" | grep -q 'fabric.mod.json'
+          unzip -l "$JAR" | grep -q 'nova/NovaClient.class'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-client
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
