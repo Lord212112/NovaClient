@@ -1010,7 +1010,13 @@ public final class BuildModules {
 
         private boolean placeOne(Plan pl) {
             var p = mc.player;
-            if (!prepare(pl.item())) return false;
+            if (!p.getMainHandStack().isOf(pl.item())) {
+                // switching to another block: do NOT click in the same tick, the server must see the new item / slot first
+                // (otherwise it places the block that was in your hand before)
+                if (!prepare(pl.item())) return false;
+                cd = 2;
+                return false;
+            }
             Vec3d eye = p.getEyePos();
             Vec3d hit = pl.hit();
             Direction face = pl.face();
