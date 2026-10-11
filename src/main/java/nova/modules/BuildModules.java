@@ -706,7 +706,7 @@ public final class BuildModules {
         private boolean edgeAhead(Vec3d pos, double dx, double dz, double hd) {
             if (hd < 0.05) return false;
             double reachAhead = Math.min(0.6, hd + 0.3);
-            BlockPos g = BlockPos.ofFloor(pos.x + dx / hd * reachAhead, pos.y - 0.5, pos.z + dz / hd * reachAhead);
+            BlockPos g = BlockPos.ofFloored(pos.x + dx / hd * reachAhead, pos.y - 0.5, pos.z + dz / hd * reachAhead);
             BlockState s = mc.world.getBlockState(g);
             return s.getCollisionShape(mc.world, g).isEmpty() && !s.isOf(Blocks.WATER) && !climbable(g);
         }
@@ -799,7 +799,7 @@ public final class BuildModules {
 
             // never walk into lava: stop if the next step (or what is under it) is lava
             if (hd > 1e-3) {
-                BlockPos la = BlockPos.ofFloor(pos.x + dx / hd * 0.8, pos.y, pos.z + dz / hd * 0.8);
+                BlockPos la = BlockPos.ofFloored(pos.x + dx / hd * 0.8, pos.y, pos.z + dz / hd * 0.8);
                 if (isLava(la) || isLava(la.down()) || isLava(la.up())) { dropPath(300); walkCd = 10; walkStatus = "Lava ahead"; return false; }
             }
 
